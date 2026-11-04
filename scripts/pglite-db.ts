@@ -1,14 +1,20 @@
 import { PGlite } from "@electric-sql/pglite";
-import type { Db } from "../src/db.js";
+import type { Db, QueryResult } from "../src/db.js";
 
 /** A `Db` backed by PGlite (in-process Postgres). Used by tests and `npm run dev`. */
 export function pgliteDb(pg: PGlite): Db {
   return {
-    query: async (text, params = []) => (await pg.query(text, params)).rows as Record<string, unknown>[],
-    transaction: async (statements) => {
-      await pg.transaction(async (tx) => {
-        for (const statement of statements) await tx.query(statement.text, statement.params ?? []);
-      });
-    },
+    transaction: (statements) =>
+      pg.transaction(async (tx) => {
+        const results: QueryResult[] = [];
+        for (const statement of statements) {
+          const result = await tx.query(statement.text, statement.params ?? []);
+          results.push({
+            rows: result.rows as Record<string, unknown>[],
+            rowCount: result.affectedRows ?? result.rows.length,
+          });
+        }
+        return results;
+      }),
   };
 }

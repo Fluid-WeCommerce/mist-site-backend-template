@@ -1,4 +1,5 @@
 import { PGlite } from "@electric-sql/pglite";
+import type { Db } from "../src/db.js";
 import { createHandler } from "../src/handler.js";
 import { sign } from "../src/signature.js";
 import { pgliteDb } from "../scripts/pglite-db.js";
@@ -56,6 +57,11 @@ export function signedRequest(body: unknown, options: SignedOptions = {}): Reque
 
 export function makeHandler(pg: PGlite, overrideEnv: Record<string, string | undefined> = env) {
   return createHandler({ env: overrideEnv, db: pgliteDb(pg), now: () => NOW });
+}
+
+/** A handler over an injected `Db`, for failures PGlite cannot produce. */
+export function handlerFor(db: Db, overrideEnv: Record<string, string | undefined> = env) {
+  return createHandler({ env: overrideEnv, db, now: () => NOW });
 }
 
 // Parsed response bodies are asserted on directly, so they stay loosely typed.

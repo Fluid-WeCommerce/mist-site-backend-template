@@ -1,18 +1,21 @@
 import { invalidParams } from "./errors.js";
 
-const IDENTIFIER = /^[a-z_][a-z0-9_]{0,62}$/;
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 
-/** Validates a table or column name and returns it double-quoted. */
-export function quoteIdentifier(value: unknown, field: string): string {
+/** Refuses a name that cannot be an identifier before it is looked up in the catalog. */
+export function checkIdentifier(value: unknown, field: string): string {
   if (typeof value !== "string" || !IDENTIFIER.test(value)) {
-    throw invalidParams(
-      `${field} must be an identifier matching ${IDENTIFIER.source} (lowercase letters, digits, underscore)`,
-    );
+    throw invalidParams(`${field} must be an identifier matching ${IDENTIFIER.source}`, field);
   }
-  return `"${value}"`;
+  return value;
 }
 
-/** Validates a table name and returns it schema-qualified; only `public` is reachable. */
-export function quoteTable(value: unknown, field = "table"): string {
-  return `"public".${quoteIdentifier(value, field)}`;
+/** Double-quotes a name. Callers pass only names found in the catalog. */
+export function quote(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+/** A catalog table name, schema-qualified; only `public` is reachable. */
+export function quoteTable(name: string): string {
+  return `"public".${quote(name)}`;
 }

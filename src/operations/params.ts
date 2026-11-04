@@ -27,16 +27,16 @@ export class Params {
 export function columnValue(value: unknown, field: string): unknown {
   if (isScalar(value)) return value;
   if (typeof value === "object") return JSON.stringify(value);
-  throw invalidParams(`${field} must be a string, number, boolean, null, object or array`);
+  throw invalidParams(`${field} must be a string, number, boolean, null, object or array`, field);
 }
 
-/** A record id: a non-empty string or a number. */
+/** A row key: a non-empty string or a number. */
 export function recordId(value: unknown): string | number {
   if ((typeof value === "string" && value !== "") || typeof value === "number") return value;
-  throw invalidParams("id must be a string or number");
+  throw invalidParams("id must be a string or number", "id");
 }
 
 export function requireObject(value: unknown, field: string): Record<string, unknown> {
-  if (!isPlainObject(value)) throw invalidParams(`${field} must be an object`);
+  if (!isPlainObject(value)) throw invalidParams(`${field} must be an object`, field);
   return value;
 }

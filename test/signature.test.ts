@@ -1,15 +1,13 @@
+import { readFileSync } from "node:fs";
 import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MAX_BODY_BYTES } from "../src/body.js";
 import { sign, verifySignature } from "../src/signature.js";
 import { NOW, SECRET, envelope, makeHandler, readJson, signedRequest } from "./helpers.js";
 
-const VECTOR = {
-  secret: "whsec_backend_vector_secret",
-  timestamp: "1800000000",
-  body: '{"operation":"list_notes","params":{"limit":10},"company":{"id":1,"fluid_shop":"example.fluid.app"},"member":{"id":"0198c7a4-3d8e-7a52-9b6c-1e0f4a7d2c93","public_id":"0198c7a4-52f1-7b3e-9d0a-6f4e1c2b8a35","external_id":null},"site":{"id":"0198c7a4-6a10-7c11-8e2f-3b5d7a9c1e47"}}',
-  signature: "f9b645523800f33fe36df6b2f00261bf6e7ccc2cbf55c87a5138a3204302227b",
-};
+const VECTOR = JSON.parse(
+  readFileSync(new URL("../contract/signature-vector.json", import.meta.url), "utf8"),
+) as { secret: string; timestamp: string; body: string; signature: string };
 
 const verify = (overrides: Partial<Parameters<typeof verifySignature>[0]> = {}) =>
   verifySignature({
@@ -135,6 +133,7 @@ describe("request verification", () => {
     const big = JSON.stringify({ ...body, padding: "x".repeat(MAX_BODY_BYTES) });
     const signed = await handle(signedRequest(big));
     expect(signed.status).toBe(413);
+    expect((await readJson(signed)).error.code).toBe("invalid_request");
     const unsigned = await handle(signedRequest(big, { omit: ["x-fluid-signature"] }));
     expect(unsigned.status).toBe(413);
   });
@@ -168,7 +167,7 @@ describe("request verification", () => {
   it("answers 400 for a signed body that is not JSON", async () => {
     const response = await handle(signedRequest("not json"));
     expect(response.status).toBe(400);
-    expect((await readJson(response)).error.code).toBe("invalid_json");
+    expect((await readJson(response)).error.code).toBe("invalid_request");
   });
 
   it("does not parse before verifying: unsigned garbage is a 401, not a 400", async () => {

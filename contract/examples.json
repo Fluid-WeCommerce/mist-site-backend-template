@@ -1,0 +1,558 @@
+{
+  "description": "Contract examples for the six operations, replayed in order against an empty database by this repository's tests (test/contract.test.ts) and by the Rails stub receiver. Each request is wrapped in the signed envelope of the plan. A response `body` is matched as a subset of the real body: error bodies are matched on `error.code` only, and the string \"<opaque>\" matches any non-empty string (a cursor).",
+  "examples": [
+    {
+      "name": "tables.list on an empty database",
+      "request": {
+        "operation": "tables.list",
+        "params": {}
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "tables": []
+        }
+      }
+    },
+    {
+      "name": "sql.run creates a table",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "CREATE TABLE notes (id serial PRIMARY KEY, title text NOT NULL UNIQUE, body text)"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "command": "CREATE TABLE",
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "sql.run creates a table without a primary key",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "CREATE TABLE loose (name text)"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "command": "CREATE TABLE",
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "tables.list lists tables, columns and the primary key",
+      "request": {
+        "operation": "tables.list",
+        "params": {}
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "tables": [
+            {
+              "name": "loose",
+              "columns": [
+                {
+                  "name": "name",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "primary_key": false
+                }
+              ]
+            },
+            {
+              "name": "notes",
+              "columns": [
+                {
+                  "name": "id",
+                  "type": "integer",
+                  "nullable": false,
+                  "default": "nextval('notes_id_seq'::regclass)",
+                  "primary_key": true
+                },
+                {
+                  "name": "title",
+                  "type": "text",
+                  "nullable": false,
+                  "default": null,
+                  "primary_key": false
+                },
+                {
+                  "name": "body",
+                  "type": "text",
+                  "nullable": true,
+                  "default": null,
+                  "primary_key": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "rows.insert returns the inserted rows",
+      "request": {
+        "operation": "rows.insert",
+        "params": {
+          "table": "notes",
+          "rows": [
+            {
+              "title": "alpha",
+              "body": "first"
+            },
+            {
+              "title": "bravo",
+              "body": null
+            },
+            {
+              "title": "charlie",
+              "body": "third"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "rows": [
+            {
+              "id": 1,
+              "title": "alpha",
+              "body": "first"
+            },
+            {
+              "id": 2,
+              "title": "bravo",
+              "body": null
+            },
+            {
+              "id": 3,
+              "title": "charlie",
+              "body": "third"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "rows.list with a filter, a sort and a limit returns a cursor for the rest",
+      "request": {
+        "operation": "rows.list",
+        "params": {
+          "table": "notes",
+          "filters": [
+            {
+              "column": "id",
+              "op": "gte",
+              "value": 2
+            }
+          ],
+          "sort": [
+            {
+              "column": "title",
+              "direction": "desc"
+            }
+          ],
+          "limit": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "rows": [
+            {
+              "id": 3,
+              "title": "charlie",
+              "body": "third"
+            }
+          ],
+          "next_cursor": "<opaque>"
+        }
+      }
+    },
+    {
+      "name": "rows.list with the default limit ends with a null cursor",
+      "request": {
+        "operation": "rows.list",
+        "params": {
+          "table": "notes"
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "rows": [
+            {
+              "id": 1,
+              "title": "alpha",
+              "body": "first"
+            },
+            {
+              "id": 2,
+              "title": "bravo",
+              "body": null
+            },
+            {
+              "id": 3,
+              "title": "charlie",
+              "body": "third"
+            }
+          ],
+          "next_cursor": null
+        }
+      }
+    },
+    {
+      "name": "rows.list with in and is_null filters",
+      "request": {
+        "operation": "rows.list",
+        "params": {
+          "table": "notes",
+          "filters": [
+            {
+              "column": "title",
+              "op": "in",
+              "value": [
+                "alpha",
+                "bravo"
+              ]
+            },
+            {
+              "column": "body",
+              "op": "is_null",
+              "value": true
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "rows": [
+            {
+              "id": 2,
+              "title": "bravo",
+              "body": null
+            }
+          ],
+          "next_cursor": null
+        }
+      }
+    },
+    {
+      "name": "rows.update addresses the row by its primary key",
+      "request": {
+        "operation": "rows.update",
+        "params": {
+          "table": "notes",
+          "id": 2,
+          "values": {
+            "body": "second"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "row": {
+            "id": 2,
+            "title": "bravo",
+            "body": "second"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.delete removes the row",
+      "request": {
+        "operation": "rows.delete",
+        "params": {
+          "table": "notes",
+          "id": 3
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "deleted": true
+        }
+      }
+    },
+    {
+      "name": "rows.delete of a missing row",
+      "request": {
+        "operation": "rows.delete",
+        "params": {
+          "table": "notes",
+          "id": 3
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "row_not_found"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.update of a missing row",
+      "request": {
+        "operation": "rows.update",
+        "params": {
+          "table": "notes",
+          "id": 99,
+          "values": {
+            "body": "x"
+          }
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "row_not_found"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.list of a table that is not in the catalog",
+      "request": {
+        "operation": "rows.list",
+        "params": {
+          "table": "ghosts"
+        }
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "table_not_found"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.insert of a duplicate unique value",
+      "request": {
+        "operation": "rows.insert",
+        "params": {
+          "table": "notes",
+          "rows": [
+            {
+              "title": "alpha"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 409,
+        "body": {
+          "error": {
+            "code": "conflict"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.insert that breaks a not-null constraint",
+      "request": {
+        "operation": "rows.insert",
+        "params": {
+          "table": "notes",
+          "rows": [
+            {
+              "body": "no title"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "constraint_violation"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.list filtering on a column that is not in the catalog",
+      "request": {
+        "operation": "rows.list",
+        "params": {
+          "table": "notes",
+          "filters": [
+            {
+              "column": "nope",
+              "op": "eq",
+              "value": 1
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_params"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.update of a table without a single-column primary key",
+      "request": {
+        "operation": "rows.update",
+        "params": {
+          "table": "loose",
+          "id": 1,
+          "values": {
+            "name": "x"
+          }
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_params"
+          }
+        }
+      }
+    },
+    {
+      "name": "rows.list with a cursor the template did not issue",
+      "request": {
+        "operation": "rows.list",
+        "params": {
+          "table": "notes",
+          "cursor": "bogus"
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_cursor"
+          }
+        }
+      }
+    },
+    {
+      "name": "sql.run refuses a statement that is not a schema statement",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "SELECT * FROM notes"
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_statement"
+          }
+        }
+      }
+    },
+    {
+      "name": "sql.run refuses CREATE TABLE AS, which would copy rows",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "CREATE TABLE copy AS SELECT * FROM notes"
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_statement"
+          }
+        }
+      }
+    },
+    {
+      "name": "sql.run refuses a view",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "CREATE VIEW v AS SELECT title FROM notes"
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_statement"
+          }
+        }
+      }
+    },
+    {
+      "name": "sql.run refuses two commands and runs neither",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "CREATE TABLE a (id int); DROP TABLE notes"
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_statement"
+          }
+        }
+      }
+    },
+    {
+      "name": "sql.run refuses an empty statement",
+      "request": {
+        "operation": "sql.run",
+        "params": {
+          "statement": "  "
+        }
+      },
+      "response": {
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_statement"
+          }
+        }
+      }
+    },
+    {
+      "name": "an operation the template does not have",
+      "request": {
+        "operation": "rows.explode",
+        "params": {}
+      },
+      "response": {
+        "status": 404,
+        "body": {
+          "error": {
+            "code": "unknown_operation"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,21 +1,20 @@
-import type { Db, Row } from "../db.js";
-import { ApiError, invalidParams } from "../errors.js";
-import { quoteIdentifier, quoteTable } from "../identifiers.js";
-import {
-  Params,
-  columnValue,
-  isPlainObject,
-  isScalar,
-  recordId,
-  requireObject,
-} from "./params.js";
+import { findColumn, findTable, singleKey, type TableInfo } from "../catalog.js";
+import { issueCursor, queryFingerprint, readCursor } from "../cursor.js";
+import { run, type Row } from "../db.js";
+import { ApiError, invalidParams, rowNotFound } from "../errors.js";
+import { quote, quoteTable } from "../identifiers.js";
+import { toJson } from "../json.js";
+import type { OperationContext } from "./index.js";
+import { Params, columnValue, isScalar, recordId, requireObject } from "./params.js";
 
-export const DEFAULT_LIMIT = 50;
+export const DEFAULT_LIMIT = 25;
 export const MAX_LIMIT = 100;
+/** A page ends before its serialized rows pass this many bytes (the response cap is 256 KiB). */
+export const PAGE_BYTE_BUDGET = 192 * 1024;
 const MAX_IN_VALUES = 100;
 const MAX_INSERT_ROWS = 100;
-const MAX_ORDER_COLUMNS = 10;
-const MAX_OFFSET = 1_000_000_000;
+const MAX_FILTERS = 50;
+const MAX_SORT_COLUMNS = 10;
 
 const COMPARISONS: Record<string, string> = {
   eq: "=",
@@ -25,181 +24,219 @@ const COMPARISONS: Record<string, string> = {
   gt: ">",
   gte: ">=",
 };
+const OPERATORS = [...Object.keys(COMPARISONS), "in", "is_null"];
 
-function notFound(): ApiError {
-  return new ApiError(404, "not_found", "No row with that id");
+interface Filter {
+  column: string;
+  op: string;
+  value: unknown;
 }
 
-/** One `where` entry may carry several operators; they are ANDed. */
-function condition(column: string, spec: unknown, params: Params): string[] {
-  const quoted = quoteIdentifier(column, `where column "${column}"`);
-  const operators = isPlainObject(spec) ? Object.entries(spec) : [["eq", spec] as const];
-  if (operators.length === 0) throw invalidParams(`where.${column} must not be an empty object`);
+interface Sort {
+  column: string;
+  direction: "asc" | "desc";
+}
 
-  return operators.map(([op, value]) => {
-    const field = `where.${column}.${op}`;
-    if (op === "is_null") {
-      if (typeof value !== "boolean") throw invalidParams(`${field} must be a boolean`);
-      return `${quoted} IS ${value ? "" : "NOT "}NULL`;
+function parseFilters(raw: unknown): Filter[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > MAX_FILTERS) {
+    throw invalidParams(`filters must be an array of at most ${MAX_FILTERS} entries`, "filters");
+  }
+  return raw.map((entry, i) => {
+    const field = `filters[${i}]`;
+    const item = requireObject(entry, field);
+    const { column, op, value } = item;
+    if (typeof column !== "string") throw invalidParams(`${field}.column must be a string`, `${field}.column`);
+    if (typeof op !== "string" || !OPERATORS.includes(op)) {
+      throw invalidParams(`${field}.op must be one of ${OPERATORS.join(", ")}`, `${field}.op`);
     }
-    if (op === "in") {
-      if (!Array.isArray(value) || value.length === 0 || value.length > MAX_IN_VALUES) {
-        throw invalidParams(`${field} must be an array of 1 to ${MAX_IN_VALUES} values`);
-      }
-      if (!value.every((v) => isScalar(v) && v !== null)) {
-        throw invalidParams(`${field} must contain only strings, numbers or booleans`);
-      }
-      return `${quoted} IN (${value.map((v) => params.add(v)).join(", ")})`;
-    }
-    if (op === "like" || op === "ilike") {
-      if (typeof value !== "string") throw invalidParams(`${field} must be a string`);
-      return `${quoted} ${op.toUpperCase()} ${params.add(value)}`;
-    }
-    const symbol = Object.hasOwn(COMPARISONS, op) ? COMPARISONS[op] : undefined;
-    if (!symbol) throw invalidParams(`${field}: unknown operator "${op}"`);
-    if (!isScalar(value)) throw invalidParams(`${field} must be a string, number, boolean or null`);
-    if (value === null) {
-      // `= NULL` never matches in SQL; read a null comparison as an IS test.
-      if (op === "eq") return `${quoted} IS NULL`;
-      if (op === "neq") return `${quoted} IS NOT NULL`;
-      throw invalidParams(`${field} cannot be null`);
-    }
-    return `${quoted} ${symbol} ${params.add(value)}`;
+    return { column, op, value };
   });
 }
 
-function whereClause(where: unknown, params: Params): string {
-  if (where === undefined) return "";
-  const spec = requireObject(where, "where");
-  const clauses = Object.entries(spec).flatMap(([column, value]) =>
-    condition(column, value, params),
-  );
-  return clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
-}
-
-function orderClause(order: unknown): string {
-  if (order === undefined) return "";
-  if (!Array.isArray(order) || order.length > MAX_ORDER_COLUMNS) {
-    throw invalidParams(`order must be an array of at most ${MAX_ORDER_COLUMNS} entries`);
+function parseSort(raw: unknown): Sort[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.length > MAX_SORT_COLUMNS) {
+    throw invalidParams(`sort must be an array of at most ${MAX_SORT_COLUMNS} entries`, "sort");
   }
-  const parts = order.map((entry, index) => {
-    const item = requireObject(entry, `order[${index}]`);
-    const column = quoteIdentifier(item.column, `order[${index}].column`);
+  return raw.map((entry, i) => {
+    const field = `sort[${i}]`;
+    const item = requireObject(entry, field);
+    if (typeof item.column !== "string") {
+      throw invalidParams(`${field}.column must be a string`, `${field}.column`);
+    }
     const direction = item.direction ?? "asc";
     if (direction !== "asc" && direction !== "desc") {
-      throw invalidParams(`order[${index}].direction must be "asc" or "desc"`);
+      throw invalidParams(`${field}.direction must be "asc" or "desc"`, `${field}.direction`);
     }
-    return `${column} ${direction.toUpperCase()}`;
+    return { column: item.column, direction };
   });
-  return parts.length > 0 ? ` ORDER BY ${parts.join(", ")}` : "";
 }
 
-/** `limit` above the maximum is capped, not refused. */
 function limitValue(limit: unknown): number {
   if (limit === undefined) return DEFAULT_LIMIT;
-  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
-    throw invalidParams("limit must be a positive integer");
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+    throw invalidParams(`limit must be an integer from 1 to ${MAX_LIMIT}`, "limit");
   }
-  return Math.min(limit, MAX_LIMIT);
+  return limit;
 }
 
-export function encodeCursor(offset: number): string {
-  return Buffer.from(String(offset), "utf8").toString("base64url");
-}
+function condition(table: TableInfo, filter: Filter, index: number, params: Params): string {
+  const field = `filters[${index}]`;
+  const column = quote(findColumn(table, filter.column, `${field}.column`).name);
+  const { op, value } = filter;
+  const valueField = `${field}.value`;
 
-function decodeCursor(cursor: unknown): number {
-  if (cursor === undefined) return 0;
-  if (typeof cursor !== "string") throw invalidParams("cursor must be a string");
-  const text = Buffer.from(cursor, "base64url").toString("utf8");
-  if (!/^[0-9]{1,10}$/.test(text) || Number(text) > MAX_OFFSET) {
-    throw invalidParams("cursor is not valid");
+  if (op === "is_null") {
+    if (typeof value !== "boolean") throw invalidParams(`${valueField} must be a boolean`, valueField);
+    return `${column} IS ${value ? "" : "NOT "}NULL`;
   }
-  return Number(text);
+  if (op === "in") {
+    if (!Array.isArray(value) || value.length === 0 || value.length > MAX_IN_VALUES) {
+      throw invalidParams(`${valueField} must be an array of 1 to ${MAX_IN_VALUES} values`, valueField);
+    }
+    if (!value.every((v) => isScalar(v) && v !== null)) {
+      throw invalidParams(`${valueField} must contain only strings, numbers or booleans`, valueField);
+    }
+    return `${column} IN (${value.map((v) => params.add(v)).join(", ")})`;
+  }
+  if (!isScalar(value)) {
+    throw invalidParams(`${valueField} must be a string, number, boolean or null`, valueField);
+  }
+  if (value === null) {
+    // `= NULL` never matches in SQL; read a null comparison as an IS test.
+    if (op === "eq") return `${column} IS NULL`;
+    if (op === "neq") return `${column} IS NOT NULL`;
+    throw invalidParams(`${valueField} cannot be null for ${op}`, valueField);
+  }
+  return `${column} ${COMPARISONS[op]} ${params.add(value)}`;
 }
 
 export async function rowsList(
-  db: Db,
+  { db, secret }: OperationContext,
   params: Record<string, unknown>,
 ): Promise<{ rows: Row[]; next_cursor: string | null }> {
-  const table = quoteTable(params.table);
   const limit = limitValue(params.limit);
-  const offset = decodeCursor(params.cursor);
+  const filters = parseFilters(params.filters);
+  const sort = parseSort(params.sort);
+  const table = await findTable(db, params.table);
 
   const bound = new Params();
-  const where = whereClause(params.where, bound);
-  const order = orderClause(params.order);
-  const sql = `SELECT * FROM ${table}${where}${order} LIMIT ${bound.add(limit + 1)} OFFSET ${bound.add(offset)}`;
+  const where = filters.map((f, i) => condition(table, f, i, bound));
+  const order = sort.map((s, i) => `${quote(findColumn(table, s.column, `sort[${i}].column`).name)} ${s.direction.toUpperCase()}`);
+  // Ending the order with the primary key keeps offset paging stable.
+  const sorted = new Set(sort.map((s) => s.column));
+  for (const column of table.columns) {
+    if (column.primary_key && !sorted.has(column.name)) order.push(quote(column.name));
+  }
 
-  const fetched = await db.query(sql, bound.values);
-  const hasMore = fetched.length > limit;
+  const fingerprint = queryFingerprint({ table: table.name, filters, sort });
+  const offset = params.cursor === undefined ? 0 : readCursor(secret, fingerprint, params.cursor);
+
+  const sql =
+    `SELECT * FROM ${quoteTable(table.name)}` +
+    (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
+    (order.length > 0 ? ` ORDER BY ${order.join(", ")}` : "") +
+    ` LIMIT ${bound.add(limit + 1)} OFFSET ${bound.add(offset)}`;
+  const [result] = await run(db, [{ text: sql, params: bound.values }]);
+  const fetched = result?.rows ?? [];
+
+  // Take rows until the limit or the byte budget, whichever comes first.
+  const page: Row[] = [];
+  let bytes = 2;
+  for (const row of fetched.slice(0, limit)) {
+    const size = Buffer.byteLength(toJson(row)) + (page.length > 0 ? 1 : 0);
+    if (bytes + size > PAGE_BYTE_BUDGET) {
+      if (page.length === 0) {
+        throw new ApiError(422, "row_too_large", "A single row is larger than the response budget", {
+          budget_bytes: PAGE_BYTE_BUDGET,
+        });
+      }
+      break;
+    }
+    bytes += size;
+    page.push(row);
+  }
+
+  const more = page.length < fetched.length;
   return {
-    rows: hasMore ? fetched.slice(0, limit) : fetched,
-    next_cursor: hasMore ? encodeCursor(offset + limit) : null,
+    rows: page,
+    next_cursor: more ? issueCursor(secret, fingerprint, offset + page.length) : null,
   };
 }
 
 export async function rowsInsert(
-  db: Db,
+  { db }: OperationContext,
   params: Record<string, unknown>,
 ): Promise<{ rows: Row[] }> {
-  const table = quoteTable(params.table);
   const rows = params.rows;
   if (!Array.isArray(rows) || rows.length < 1 || rows.length > MAX_INSERT_ROWS) {
-    throw invalidParams(`rows must be an array of 1 to ${MAX_INSERT_ROWS} objects`);
+    throw invalidParams(`rows must be an array of 1 to ${MAX_INSERT_ROWS} objects`, "rows");
   }
-
-  const objects = rows.map((row, index) => requireObject(row, `rows[${index}]`));
+  const objects = rows.map((row, i) => requireObject(row, `rows[${i}]`));
   const keys = Object.keys(objects[0] as Record<string, unknown>);
-  if (keys.length === 0) throw invalidParams("rows[0] must have at least one column");
-  const columns = keys.map((key) => quoteIdentifier(key, `column "${key}"`));
+  if (keys.length === 0) throw invalidParams("rows[0] must have at least one column", "rows[0]");
+  objects.forEach((row, i) => {
+    const rowKeys = Object.keys(row);
+    if (rowKeys.length !== keys.length || !keys.every((k) => Object.hasOwn(row, k))) {
+      throw invalidParams(`rows[${i}] must have the same columns as rows[0]`, `rows[${i}]`);
+    }
+  });
+
+  const table = await findTable(db, params.table);
+  const columns = keys.map((key) => quote(findColumn(table, key, `rows[0].${key}`).name));
 
   const bound = new Params();
-  const tuples = objects.map((row, index) => {
-    const rowKeys = Object.keys(row);
-    if (rowKeys.length !== keys.length || !keys.every((key) => Object.hasOwn(row, key))) {
-      throw invalidParams(`rows[${index}] must have the same columns as rows[0]`);
-    }
-    const placeholders = keys.map((key) =>
-      bound.add(columnValue(row[key], `rows[${index}].${key}`)),
-    );
+  const tuples = objects.map((row, i) => {
+    const placeholders = keys.map((key) => bound.add(columnValue(row[key], `rows[${i}].${key}`)));
     return `(${placeholders.join(", ")})`;
   });
 
-  const sql = `INSERT INTO ${table} (${columns.join(", ")}) VALUES ${tuples.join(", ")} RETURNING *`;
-  return { rows: await db.query(sql, bound.values) };
+  // One statement, so all rows are inserted or none.
+  const sql = `INSERT INTO ${quoteTable(table.name)} (${columns.join(", ")}) VALUES ${tuples.join(", ")} RETURNING *`;
+  const [result] = await run(db, [{ text: sql, params: bound.values }]);
+  return { rows: result?.rows ?? [] };
 }
 
 export async function rowsUpdate(
-  db: Db,
+  { db }: OperationContext,
   params: Record<string, unknown>,
 ): Promise<{ row: Row }> {
-  const table = quoteTable(params.table);
   const id = recordId(params.id);
   const values = requireObject(params.values, "values");
   const entries = Object.entries(values);
-  if (entries.length === 0) throw invalidParams("values must not be empty");
-  if (Object.hasOwn(values, "id")) throw invalidParams("values.id cannot be updated");
+  if (entries.length === 0) throw invalidParams("values must not be empty", "values");
+
+  const table = await findTable(db, params.table);
+  const key = singleKey(table);
 
   const bound = new Params();
-  const assignments = entries.map(
-    ([key, value]) =>
-      `${quoteIdentifier(key, `column "${key}"`)} = ${bound.add(columnValue(value, `values.${key}`))}`,
-  );
-  const sql = `UPDATE ${table} SET ${assignments.join(", ")} WHERE "id" = ${bound.add(id)} RETURNING *`;
+  const assignments = entries.map(([name, value]) => {
+    const column = findColumn(table, name, `values.${name}`);
+    if (column.name === key.name) {
+      throw invalidParams(`values.${name} is the primary key and cannot be updated`, `values.${name}`);
+    }
+    return `${quote(column.name)} = ${bound.add(columnValue(value, `values.${name}`))}`;
+  });
+  const sql = `UPDATE ${quoteTable(table.name)} SET ${assignments.join(", ")} WHERE ${quote(key.name)} = ${bound.add(id)} RETURNING *`;
 
-  const [row] = await db.query(sql, bound.values);
-  if (!row) throw notFound();
+  const [result] = await run(db, [{ text: sql, params: bound.values }]);
+  const row = result?.rows[0];
+  if (!row) throw rowNotFound();
   return { row };
 }
 
 export async function rowsDelete(
-  db: Db,
+  { db }: OperationContext,
   params: Record<string, unknown>,
 ): Promise<{ deleted: true }> {
-  const table = quoteTable(params.table);
   const id = recordId(params.id);
-  const deleted = await db.query(`DELETE FROM ${table} WHERE "id" = $1 RETURNING "id"`, [id]);
-  if (deleted.length === 0) throw notFound();
+  const table = await findTable(db, params.table);
+  const key = singleKey(table);
+
+  const sql = `DELETE FROM ${quoteTable(table.name)} WHERE ${quote(key.name)} = $1 RETURNING ${quote(key.name)}`;
+  const [result] = await run(db, [{ text: sql, params: [id] }]);
+  if (!result || result.rows.length === 0) throw rowNotFound();
   return { deleted: true };
 }
 

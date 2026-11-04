@@ -3,10 +3,16 @@ import { rowsDelete, rowsInsert, rowsList, rowsUpdate } from "./rows.js";
 import { sqlRun } from "./sql.js";
 import { tablesList } from "./tables.js";
 
-export type Operation = (db: Db, params: Record<string, unknown>) => Promise<unknown>;
+export interface OperationContext {
+  db: Db;
+  /** The signing secret; also signs the cursors this template issues. */
+  secret: string;
+}
+
+export type Operation = (ctx: OperationContext, params: Record<string, unknown>) => Promise<unknown>;
 
 export const operations: Record<string, Operation> = {
-  "tables.list": (db) => tablesList(db),
+  "tables.list": (ctx) => tablesList(ctx),
   "sql.run": sqlRun,
   "rows.list": rowsList,
   "rows.insert": rowsInsert,

@@ -1,7 +1,8 @@
 import { BodyTooLargeError, readBody } from "./body.js";
 import { readConfig, type Env } from "./config.js";
 import { neonDb, type Db } from "./db.js";
-import { ApiError, mapDbError } from "./errors.js";
+import { ApiError, invalidRequest, toApiError } from "./errors.js";
+import { toJson } from "./json.js";
 import { findOperation } from "./operations/index.js";
 import { isPlainObject } from "./operations/params.js";
 import { verifySignature } from "./signature.js";
@@ -17,17 +18,22 @@ export interface HandlerOptions {
 
 const HEADERS = { "content-type": "application/json", "cache-control": "no-store" };
 
-// bigint columns come back as BigInt, which JSON cannot carry; send them as strings.
-const toJson = (value: unknown) =>
-  JSON.stringify(value, (_key, v: unknown) => (typeof v === "bigint" ? v.toString() : v));
-
 function json(status: number, body: unknown): Response {
   return new Response(toJson(body), { status, headers: HEADERS });
 }
 
-function failure(status: number, code: string, message?: string): Response {
-  return json(status, { error: message === undefined ? { code } : { code, message } });
+/** `{ error: { code, message, details } }`. Without a message, only the code is sent. */
+function failure(
+  status: number,
+  code: string,
+  message?: string,
+  details: Record<string, unknown> = {},
+): Response {
+  return json(status, { error: message === undefined ? { code } : { code, message, details } });
 }
+
+const apiFailure = (error: ApiError) =>
+  failure(error.status, error.code, error.message, error.details);
 
 const unauthorized = () => failure(401, "unauthorized");
 
@@ -54,7 +60,7 @@ export function createHandler(options: HandlerOptions = {}): (request: Request) 
         body = await readBody(request);
       } catch (error) {
         if (error instanceof BodyTooLargeError) {
-          return failure(413, "payload_too_large", "Request body must be 64 KiB or smaller");
+          return apiFailure(invalidRequest(413, "Request body must be 64 KiB or smaller"));
         }
         throw error;
       }
@@ -75,10 +81,10 @@ export function createHandler(options: HandlerOptions = {}): (request: Request) 
       try {
         envelope = JSON.parse(Buffer.from(body).toString("utf8"));
       } catch {
-        return failure(400, "invalid_json", "Request body is not valid JSON");
+        return apiFailure(invalidRequest(400, "Request body is not valid JSON"));
       }
       if (!isPlainObject(envelope)) {
-        return failure(400, "invalid_request", "Request body must be a JSON object");
+        return apiFailure(invalidRequest(400, "Request body must be a JSON object"));
       }
 
       // 6. The request must be for this copy's site and company.
@@ -89,26 +95,27 @@ export function createHandler(options: HandlerOptions = {}): (request: Request) 
       }
 
       if (typeof envelope.operation !== "string") {
-        return failure(400, "invalid_request", "operation must be a string");
+        return apiFailure(invalidRequest(400, "operation must be a string"));
       }
       const operation = findOperation(envelope.operation);
-      if (!operation) return failure(400, "unknown_operation", "Unknown operation");
+      if (!operation) return failure(404, "unknown_operation", "Unknown operation");
 
       const params = envelope.params ?? {};
       if (!isPlainObject(params)) {
-        return failure(400, "invalid_params", "params must be an object");
+        return apiFailure(invalidRequest(400, "params must be an object"));
       }
 
       try {
-        return json(200, await operation(databaseFor(config.databaseUrl), params));
+        const db = databaseFor(config.databaseUrl);
+        return json(200, await operation({ db, secret: config.signingSecret }, params));
       } catch (error) {
-        const mapped = error instanceof ApiError ? error : mapDbError(error);
-        if (mapped) return failure(mapped.status, mapped.code, mapped.message);
-        throw error;
+        const mapped = toApiError(error, envelope.operation);
+        if (mapped.status >= 500) console.error("site backend operation failed", error);
+        return apiFailure(mapped);
       }
     } catch (error) {
       console.error("site backend request failed", error);
-      return failure(500, "server_error", "Internal server error");
+      return failure(500, "internal_error", "Internal error");
     }
   };
 }
